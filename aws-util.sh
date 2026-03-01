@@ -46,10 +46,10 @@ main() {
     check_if_command_tool_is_available "aws" || exit 1
     check_aws_credentials || exit 1
 
-    sts
+    # sts
     eks
     # ec2
-    describe_ebs_snapshots
+    # describe_ebs_snapshots
 }
 
 main
