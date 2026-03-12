@@ -151,7 +151,7 @@ wait_for_cluster_update_to_complete() {
 wait_for_cluster_to_be_active() {
     local cluster_name="$1"
 
-    log_info "Waiting for EKS cluster '$cluster_name' to be in ACTIVE state..."
+    log_wait "Waiting for EKS cluster '$cluster_name' to be in ACTIVE state..."
     echo "Waiting for cluster to reach status ACTIVE..."
     if ! aws eks wait cluster-active \
         --name "$cluster_name" \
@@ -162,6 +162,86 @@ wait_for_cluster_to_be_active() {
     else
         log_success "Upgrade Complete!"
     fi
+}
+
+verify_ebs_csi_controller_is_running() {
+    log_empty_line
+    log_wait "Verifying that EBS CSI driver (controller) is running in the cluster..."
+    if kubectl get pods -n kube-system | grep ebs-csi-controller | grep Running > /dev/null 2>&1; then
+        log_success "EBS CSI driver (controller) is running."
+    else
+        log_error "EBS CSI driver (controller) is not running. Please check the status of the driver and ensure it is properly installed and running before proceeding."
+        return 1
+    fi
+}
+
+# If we see 0 pods on nodes where we expect them, we may need to update our EKS module configuration to set
+# node.tolerateAllTaints = true for the EBS CSI addon.
+verify_ebs_csi_nodes_are_running() {
+    log_empty_line
+    log_wait "Verifying that EBS CSI driver nodes are ready in the cluster..."
+    if kubectl get pods -n kube-system | grep ebs-csi-node | grep Running > /dev/null 2>&1; then
+        log_success "EBS CSI driver nodes are ready."
+    else
+        log_error "EBS CSI driver nodes are not ready. Please check the status of the nodes and ensure they are properly installed and running before proceeding."
+        return 1
+    fi
+}
+
+# Every node must register itself as a "CSI Node" that supports the ebs.csi.aws.com driver. 
+# This is the official way Kubernetes knows a node is "EBS-ready."
+verify_ebs_csi_nodes_are_registered() {
+    log_empty_line
+    log_wait "Verifying that EBS CSI driver nodes are registered in the cluster..."
+    log_info "Every node must register itself as a 'CSI Node' that supports the ebs.csi.aws.com driver. This is the official way Kubernetes knows a node is 'EBS-ready.'"
+    log_info "We should see 1 DRIVER on each node in the cluster."
+    kubectl get csinodes
+}
+
+verify_ebs_csi_is_running() {
+    log_empty_line
+    log_wait "Verifying that EBS CSI driver (controller) and nodes are running in the cluster..."
+    log_info "Usually 2 ebs-csi-controller pods and 1 ebs-csi-node pod per node should be running."
+    kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver -o wide
+}
+
+
+# Since moving to Amazon Linux 2023, the driver relies heavily on IMDSv2 and the EC2 API to identify the node's AZ and 
+# volume limits. We can check the logs of the CSI driver on one of the new nodes to ensure it successfully initialized.
+# If We see "Retrieved metadata from IMDS," our http_put_response_hop_limit = 2 setting is working perfectly.
+verify_imdsv2_and_ec2_api_connectivity() {
+    local pod_name
+
+    # Prompt user to select one of the ebs-csi-node pods to check IMDSv2 connectivity from
+    if ! pod_name=$(prompt_user_for_value "Pod name"); then
+        log_error "Pod name is required!"
+        return 1
+    fi
+   
+    log_empty_line
+    log_wait "Verifying IMDSv2 and EC2 API connectivity for pod '$pod_name'..."
+    kubectl logs -n kube-system "$pod_name" -c ebs-plugin | grep "Retrieved metadata from IMDS"
+}
+
+# The "Dry Run" Volume Check
+# We can't "partially" mount a volume, but we can check if the CSINode object correctly identifies the Availability
+# Zone. This is the most common reason EBS volumes fail to move—the new node is in the wrong AZ.
+# Look for the topology.ebs.csi.aws.com/zone label. It must match the AZ of our EBS volume (e.g., us-east-2a).
+describe_csi_node() {
+    local node_name
+
+    log_empty_line
+    log_info "Describing a CSI Node to check if it has the correct topology label for EBS volumes (topology.ebs.csi.aws.com/zone). This label must match the AZ of our EBS volumes (e.g., us-east-2a)."
+
+    # Prompt user to select one of the ebs-csi-node pods to check IMDSv2 connectivity from
+    if ! node_name=$(prompt_user_for_value "Node name"); then
+        log_error "Node name is required!"
+        return 1
+    fi
+
+    log_empty_line
+    log_wait "Describing CSI Node '$node_name'..."
+    kubectl describe csinode "$node_name"
 }
 
 list_ebs_volumes() {
@@ -336,7 +416,7 @@ eks() {
     #
     # Clusters
     #
-    list_clusters
+    # list_clusters
 
     #
     # Context
@@ -350,7 +430,7 @@ eks() {
 
     show_cluster_status "$cluster_name"
     show_update_status_of_cluster "$cluster_name"
-    wait_for_cluster_to_be_active "$cluster_name"
+    # wait_for_cluster_to_be_active "$cluster_name"
 
     #
     # Addons
@@ -361,6 +441,10 @@ eks() {
     #
     # EBS
     #
+    # verify_ebs_csi_is_running
+    # verify_ebs_csi_nodes_are_registered
+    # verify_imdsv2_and_ec2_api_connectivity
+    # describe_csi_node
     # list_ebs_volumes
     # list_ebs_volumes_in_use_in_k8s_cluster
     # list_ebs_volumes_in_use_in_k8s_cluster 11

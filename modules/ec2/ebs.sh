@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 
- # Example usage: create_ebs_snapshot "vol-0123456789abcdef0" "My snapshot description" "MySnapshotTag"
+source ./util.sh
+
+# Example usage: create_ebs_snapshot "vol-0123456789abcdef0" "My snapshot description" "MySnapshotTag"
+# Tag example: "EKS-Upgrade-Backup"
 create_ebs_snapshot() {
     local volume_id="$1"
     local description="$2"
@@ -38,7 +41,7 @@ describe_ebs_snapshot() {
         --region "$AWS_REGION" \
         --profile "$AWS_PROFILE" \
         --snapshot-ids "$snapshot_id" \
-        --query 'Snapshots[0].{SnapshotId:SnapshotId,VolumeId:VolumeId,State:State,StartTime:StartTime,Description:Description}' \
+        --query "Snapshots[0].{Name:Tags[?Key==\`Name\`].Value | [0],SnapshotId:SnapshotId,VolumeId:VolumeId,State:State,StartTime:StartTime,Description:Description}" \
         --output json 2>&1)
     exit_code=$?
 
@@ -63,7 +66,7 @@ describe_ebs_snapshots() {
         --region "$AWS_REGION" \
         --profile "$AWS_PROFILE" \
         --owner-ids self \
-        --query 'Snapshots[*].{SnapshotId:SnapshotId,VolumeId:VolumeId,State:State,StartTime:StartTime,Description:Description,Progress:Progress}' \
+        --query "Snapshots[*].{Name:Tags[?Key==\`Name\`].Value | [0],SnapshotId:SnapshotId,VolumeId:VolumeId,State:State,StartTime:StartTime,Description:Description,Progress:Progress}" \
         --output json 2>&1)
     exit_code=$?
 
@@ -107,8 +110,147 @@ create_volume_from_snapshot() {
     return 0
 }
 
-ec2_ebs() {
-    # create_ebs_snapshot "vol-0123456789abcdef0" "My snapshot description" "MySnapshotTag"
+delete_ebs_snapshot() {
+    local snapshot_id="$1"
+    local output
+    local exit_code
 
-    describe_ebs_snapshots
+    output=$(aws ec2 delete-snapshot \
+        --region "$AWS_REGION" \
+        --profile "$AWS_PROFILE" \
+        --snapshot-id "$snapshot_id" 2>&1)
+    exit_code=$?
+
+    if [ $exit_code -ne 0 ]; then
+        log_error "Failed to delete snapshot $snapshot_id: $output"
+        return 1
+    fi
+
+    log_success "Deleted snapshot $snapshot_id successfully"
+    return 0
+}
+
+prompt_delete_ebs_snapshot() {
+    local snapshot_id
+    local output
+    local exit_code
+
+    if ! snapshot_id=$(prompt_user_for_value "Snapshot ID to delete"); then
+        log_error "Failed to get snapshot ID. Aborting."
+        return 1
+    fi
+
+    local user_confirmed
+    user_confirmed=$(prompt_user_for_confirmation "❓ Are you sure you want to delete snapshot '$snapshot_id'?" "n")
+    if [[ "$user_confirmed" == "true" ]]; then
+        delete_ebs_snapshot "$snapshot_id"
+    else
+        log_warning "Skipping deletion of snapshot: $snapshot_id"
+    fi
+    return 0
+}
+
+delete_ebs_snapshots_by_tag() {
+    local tag_key="$1"
+    local tag_value="$2"
+    local output
+    local exit_code
+
+    output=$(aws ec2 describe-snapshots \
+        --region "$AWS_REGION" \
+        --profile "$AWS_PROFILE" \
+        --owner-ids self \
+        --filters "Name=tag:$tag_key,Values=$tag_value" \
+        --query "Snapshots[].SnapshotId" \
+        --output text 2>&1)
+    exit_code=$?
+
+    if [ $exit_code -ne 0 ]; then
+        log_error "Failed to describe snapshots with tag $tag_key=$tag_value: $output"
+        return 1
+    fi
+
+    if [ -z "$output" ]; then
+        log_info "No snapshots found with tag $tag_key=$tag_value."
+        return 0
+    fi
+
+    log_info "Found snapshots with tag $tag_key=$tag_value: $output"
+
+    for snapshot_id in $output; do
+        # Prompt for confirmation before deleting each snapshot
+        local user_confirmed
+        user_confirmed=$(prompt_user_for_confirmation "❓ Are you sure you want to delete snapshot '$snapshot_id' with tag $tag_key=$tag_value?" "n")
+        if [[ "$user_confirmed" != "true" ]]; then
+            log_warning "Skipping deletion of snapshot: $snapshot_id"
+            continue
+        fi
+        delete_ebs_snapshot "$snapshot_id"
+    done
+
+    return 0
+}
+
+prompt_delete_ebs_snapshots_by_tag() {
+    local tag_key
+    local tag_value
+
+    if ! tag_key=$(prompt_user_for_value "Tag key to filter snapshots for deletion"); then
+        log_error "Failed to get tag key. Aborting."
+        return 1
+    fi
+
+    if ! tag_value=$(prompt_user_for_value "Tag value to filter snapshots for deletion"); then
+        log_error "Failed to get tag value. Aborting."
+        return 1
+    fi
+
+    delete_ebs_snapshots_by_tag "$tag_key" "$tag_value"
+}
+
+ebs_menu() {
+    local menu_options=(
+        "Describe EBS snapshots"
+        "Create snapshot from volume"
+        "Create volume from snapshot"
+        "Delete EBS snapshot"
+        "Delete EBS snapshots by tag"
+        "EXIT"
+    )
+
+    while true; do
+        show_menu_select_message "EBS"
+        select option in "${menu_options[@]}"; do
+            if [[ -n "$option" ]]; then
+                log_info "Selected option: $option\n"
+                case $option in
+                    "Describe EBS snapshots")
+                        describe_ebs_snapshots
+                        ;;
+                    "Create snapshot from volume")
+                        prompt_create_ebs_snapshot
+                        ;;
+                    "Create volume from snapshot")
+                        prompt_create_volume_from_snapshot
+                        ;;
+                    "Delete EBS snapshot")
+                        prompt_delete_ebs_snapshot
+                        ;;
+                    "Delete EBS snapshots by tag")
+                        prompt_delete_ebs_snapshots_by_tag
+                        ;;
+                    "EXIT")
+                        log_info "Exiting EBS menu."
+                        return 0
+                        ;;
+                    *)
+                        log_error "Invalid option"
+                        ;;
+                esac
+                break
+            else
+                log_error "Invalid selection. Please choose a valid option."
+            fi
+        done
+    done
 }

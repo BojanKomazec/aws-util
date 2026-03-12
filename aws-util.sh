@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1090
 
+source ./util.sh
+
 bash_import() {
     local repo="$1"
     local path="$2"
@@ -39,6 +41,58 @@ print_env_variables() {
     log_info "AWS_PAGER=$AWS_PAGER"
 }
 
+main_menu() {
+    local menu_options=(
+        "ebs"
+        "cloudwatch_logs"
+        "eks"
+        "lambda"
+        "networking"
+        "sts"
+        "EXIT"
+    )
+
+    while true; do
+        show_menu_select_message "main menu"
+
+        select option in "${menu_options[@]}"; do
+            if [[ -n "$option" ]]; then
+                log_info "Selected option: $option\n"
+                case $option in
+                    "ebs")
+                        ebs_menu
+                        ;;
+                    "cloudwatch_logs")
+                        cloudwatch_logs_menu
+                        ;;
+                    "eks")
+                        eks_menu
+                        ;;
+                    "lambda")
+                        lambda_menu
+                        ;;
+                    "networking")
+                        networking_menu
+                        ;;
+                    "sts")
+                        sts_menu
+                        ;;
+                    "EXIT")
+                        log_finish "Exiting..."
+                        exit 0
+                        ;;
+                    *)
+                        log_error "Invalid option"
+                        ;;
+                esac
+                break
+            else
+                log_error "Invalid selection. Please choose a valid option."
+            fi
+        done
+    done
+}
+
 main() {
     log_info "SCRIPT_DIR = $SCRIPT_DIR"
     load_env_file "$SCRIPT_DIR/.env"
@@ -46,10 +100,7 @@ main() {
     check_if_command_tool_is_available "aws" || exit 1
     check_aws_credentials || exit 1
 
-    # sts
-    eks
-    # ec2
-    # describe_ebs_snapshots
+    main_menu
 }
 
 main
