@@ -4,7 +4,7 @@ source ./util.sh
 
 # Example usage: create_ebs_snapshot "vol-0123456789abcdef0" "My snapshot description" "MySnapshotTag"
 # Tag example: "EKS-Upgrade-Backup"
-create_ebs_snapshot() {
+_create_ebs_snapshot() {
     local volume_id="$1"
     local description="$2"
     local tag_name="$3"
@@ -31,6 +31,30 @@ create_ebs_snapshot() {
     log_success "Created snapshot $output for volume $volume_id with description '$description'"
     return 0
 }
+
+create_ebs_snapshot() {
+    local volume_id
+    local description
+    local tag_name
+
+    if ! volume_id=$(prompt_user_for_value "Volume ID to snapshot (e.g., vol-0123456789abcdef0)"); then
+        log_error "Volume ID is required. Aborting."
+        return 1
+    fi
+
+    if ! description=$(prompt_user_for_value "Snapshot description"); then
+        log_error "Snapshot description is required. Aborting."
+        return 1
+    fi
+
+    if ! tag_name=$(prompt_user_for_value "Tag name for the snapshot (e.g., MySnapshotTag)"); then
+        log_error "Tag name is required. Aborting."
+        return 1
+    fi
+
+    _create_ebs_snapshot "$volume_id" "$description" "$tag_name"
+}
+
 
 describe_ebs_snapshot() {
     local snapshot_id="$1"
@@ -66,7 +90,15 @@ describe_ebs_snapshots() {
         --region "$AWS_REGION" \
         --profile "$AWS_PROFILE" \
         --owner-ids self \
-        --query "Snapshots[*].{Name:Tags[?Key==\`Name\`].Value | [0],SnapshotId:SnapshotId,VolumeId:VolumeId,State:State,StartTime:StartTime,Description:Description,Progress:Progress}" \
+        --query "Snapshots[*].{ \
+            Name:Tags[?Key==\`Name\`].Value | [0], \
+            SnapshotId:SnapshotId, \
+            VolumeId:VolumeId, \
+            State:State, \
+            StartTime:StartTime, \
+            Description:Description, \
+            Progress:Progress \
+        }" \
         --output json 2>&1)
     exit_code=$?
 
@@ -228,7 +260,7 @@ ebs_menu() {
                         describe_ebs_snapshots
                         ;;
                     "Create snapshot from volume")
-                        prompt_create_ebs_snapshot
+                        create_ebs_snapshot
                         ;;
                     "Create volume from snapshot")
                         prompt_create_volume_from_snapshot

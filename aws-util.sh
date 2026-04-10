@@ -20,9 +20,11 @@ bash_import "BojanKomazec/bash-util" "user_input.sh"
 source ./modules/cloudwatch_logs.sh
 source ./modules/ec2/ebs.sh
 source ./modules/eks.sh
+source ./modules/identity_services.sh
 source ./modules/lambda.sh
 source ./modules/networking.sh
 source ./modules/sts.sh
+source ./modules/vpc/vpc.sh
 
 # required by imported log.sh
 VERBOSE=true
@@ -46,9 +48,11 @@ main_menu() {
         "ebs"
         "cloudwatch_logs"
         "eks"
+        "identity services"
         "lambda"
         "networking"
         "sts"
+        "vpc"
         "EXIT"
     )
 
@@ -68,6 +72,9 @@ main_menu() {
                     "eks")
                         eks_menu
                         ;;
+                    "identity services")
+                        identity_services_menu
+                        ;;
                     "lambda")
                         lambda_menu
                         ;;
@@ -76,6 +83,9 @@ main_menu() {
                         ;;
                     "sts")
                         sts_menu
+                        ;;
+                    "vpc")
+                        vpc_menu
                         ;;
                     "EXIT")
                         log_finish "Exiting..."

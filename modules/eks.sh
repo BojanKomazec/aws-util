@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+source ./util.sh
+
+EKS_CLUSTER_NAME=""
+
 kubernetes_versions() {
     log_empty_line
     log_info "Kubectl version:"
@@ -84,7 +88,7 @@ show_cluster_status() {
         --name "$cluster_name" \
         --region "$AWS_REGION" \
         --profile "$AWS_PROFILE" \
-        --query 'cluster.{Name:name,Status:status,Version:version,PlatformVersion:platformVersion,Endpoint:endpoint,ARN:arn}' \
+        --query 'cluster.{Name:name,Status:status,Version:version,PlatformVersion:platformVersion,Endpoint:endpoint,ARN:arn,VPC:resourcesVpcConfig.vpcId}' \
         --output json 2>&1)
 
     echo "$output" | jq
@@ -97,13 +101,18 @@ show_update_status_of_cluster() {
     log_empty_line
     log_info "Fetching the most recent update ID for EKS cluster '$cluster_name' in region $AWS_REGION for account $AWS_PROFILE..."
 
-    update_id=$(aws eks list-updates \
+    update_id=$(run_and_log aws eks list-updates \
         --name "$cluster_name" \
         --query 'updateIds[0]' \
         --output text \
         --profile "$AWS_PROFILE")
 
     log_info "Most recent update ID: $update_id"
+
+    if [ "$update_id" == "None" ]; then
+        log_info "No updates found for EKS cluster '$cluster_name'."
+        return 0
+    fi
 
     log_empty_line
     log_info "Showing update $update_id status of EKS cluster '$cluster_name' in region $AWS_REGION for account $AWS_PROFILE:"
@@ -353,13 +362,12 @@ _list_addons() {
     aws_region=$2
     aws_profile=$3
 
-    output=$(aws eks list-addons \
+    run_and_log aws eks list-addons \
         --cluster-name "$eks_cluster_name" \
         --region "$aws_region" \
         --profile "$aws_profile" \
         --query 'addons' \
-        --output json 2>&1)
-    echo "$output"
+        --output json
 }
 
 list_addons() {
@@ -369,42 +377,248 @@ list_addons() {
     log_info "Listing EKS addons for cluster $EKS_CLUSTER_NAME in region $AWS_REGION:"
 
     output=$(_list_addons "$EKS_CLUSTER_NAME" "$AWS_REGION" "$AWS_PROFILE")
-    echo "$output" | jq
+    log_info "EKS addons for cluster $EKS_CLUSTER_NAME:\n$output"
 }
 
 show_addons_details() {
     log_empty_line
 
     EKS_CLUSTER_NAME=$(kubectl config current-context | cut -d'/' -f2)
-    log_info "Showing details of EKS addons for cluster $EKS_CLUSTER_NAME in region $AWS_REGION:"
+
+    local cluster_version
+    cluster_version=$(get_cluster_version)
+
+    log_info "Showing details of EKS addons for cluster $EKS_CLUSTER_NAME, running on version $cluster_version, in region $AWS_REGION:"
 
     addons_names=$(_list_addons "$EKS_CLUSTER_NAME" "$AWS_REGION" "$AWS_PROFILE" | jq -r '.[]')
     for addon in $addons_names; do
         log_info "Addon: $addon"
-        output=$(aws eks describe-addon \
+        run_and_log aws eks describe-addon \
             --cluster-name "$EKS_CLUSTER_NAME" \
             --addon-name "$addon" \
             --region "$AWS_REGION" \
             --profile "$AWS_PROFILE" \
-            --output json 2>&1)
-        echo "$output" | jq
+            --output json 2>&1
 
         log_empty_line
-        local cluster_version
-        cluster_version=$(get_cluster_version)
         log_info "Checking latest available version of addon $addon for Kubernetes version $cluster_version..."
-        output=$(aws eks describe-addon-versions \
+        output=$(run_and_log aws eks describe-addon-versions \
             --addon-name "$addon" \
             --kubernetes-version "$cluster_version" \
             --region "$AWS_REGION" \
             --profile "$AWS_PROFILE" \
-            --output json 2>&1)
+            --output json)
+        # echo "$output" | jq .
 
         # show only the latest version of the addon
-        latest_version=$(echo "$output" | jq -r '.addons[0].addonVersions | sort_by(.addonVersion) | last | .addonVersion')
+        latest_version=$(echo "$output" | jq -r '.addons[0].addonVersions[].addonVersion' | sort -V | tail -n 1)
         log_info "Latest available version of addon $addon: $latest_version"
         log_empty_line
     done
+}
+
+show_cluster_network_architecture() {
+    log_empty_line
+    echo "Discovering Cluster Network Architecture..."
+    echo "--------------------------------------------------------------------------------"
+    printf "%-24s | %-15s | %-12s | %-10s | %-15s\n" "Subnet Name" "Subnet ID" "Zone" "Type" "VPC ID"
+    echo "--------------------------------------------------------------------------------"
+
+    # 1. Get all subnets tagged for your cluster
+    SUBNETS=$(aws ec2 describe-subnets \
+        --region "$AWS_REGION" \
+        --profile "$AWS_PROFILE" \
+        --filters "Name=tag:karpenter.sh/discovery,Values=true" \
+        --query "Subnets[*].SubnetId" --output text)
+
+    # log_info "Found subnets tagged for cluster discovery:\n$SUBNETS"
+
+    for subnet in $SUBNETS; do
+        # 2. Get Subnet Details
+        DETAILS=$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --profile "$AWS_PROFILE" \
+            --subnet-ids "$subnet" \
+            --query "Subnets[0].{VpcId:VpcId,AZ:AvailabilityZone,Name:Tags[?Key==\`Name\`].Value | [0]}" --output json)
+
+        # log_info "Details for subnet $subnet:\n$DETAILS"
+
+        vpc_id=$(echo "$DETAILS" | jq -r .VpcId)
+        az=$(echo "$DETAILS" | jq -r .AZ)
+        name=$(echo "$DETAILS" | jq -r '.Name // "Unnamed"')
+
+        # log_info "name: $name, vpc_id: $vpc_id, az: $az"
+
+        # 3. Check Route Table for an Internet Gateway (IGW)
+        # This checks both explicit associations and the "Main" route table fallback
+        HAS_IGW=$(aws ec2 describe-route-tables \
+            --region "$AWS_REGION" \
+            --profile "$AWS_PROFILE" \
+            --filters "Name=association.subnet-id,Values=$subnet" \
+            --query "RouteTables[].Routes[?GatewayId != null && starts_with(GatewayId, 'igw-')].GatewayId" \
+            --output text)
+
+        # log_info "Checking for IGW in route tables associated with subnet $subnet. Found IGW routes:\n$HAS_IGW"
+
+        # If no explicit association found, check the Main route table of the VPC
+        if [ -z "$HAS_IGW" ]; then
+            HAS_IGW=$(aws ec2 describe-route-tables \
+            --region "$AWS_REGION" \
+            --profile "$AWS_PROFILE" \
+            --filters "Name=vpc-id,Values=$vpc_id" "Name=association.main,Values=true" \
+            --query "RouteTables[].Routes[?GatewayId != null && GatewayId != 'local' && starts_with(GatewayId, 'igw-')].GatewayId" \
+            --output text)
+        fi
+
+        # 4. Determine Type
+        if [ -n "$HAS_IGW" ]; then
+            type="PUBLIC"
+        else
+            type="PRIVATE"
+        fi
+
+        printf "%-24s | %-15s | %-12s | %-10s | %-15s\n" "$name" "$subnet" "$az" "$type" "$vpc_id"
+    done
+}
+
+_list_node_groups() {
+    eks_cluster_name=$1
+    aws_region=$2
+    aws_profile=$3
+
+    run_and_log aws eks list-nodegroups \
+        --cluster-name "$eks_cluster_name" \
+        --region "$aws_region" \
+        --profile "$aws_profile" \
+        --query 'nodegroups' \
+        --output text
+}
+
+list_node_groups() {
+    log_empty_line
+    log_info "Listing EKS node groups for cluster $EKS_CLUSTER_NAME in region $AWS_REGION for account $AWS_PROFILE:"
+    output=$(_list_node_groups "$EKS_CLUSTER_NAME" "$AWS_REGION" "$AWS_PROFILE")
+    echo "$output"
+}
+
+list_ec2_instances_for_node_group() {
+    local node_groups
+    local node_group_name
+
+    log_empty_line
+
+    # Prompt user to select a node group
+    node_groups=$(_list_node_groups "$EKS_CLUSTER_NAME" "$AWS_REGION" "$AWS_PROFILE")
+    if [ -z "$node_groups" ]; then  
+        log_info "No node groups found for cluster $EKS_CLUSTER_NAME."
+        return 0
+    fi
+    log_info "Node groups for cluster $EKS_CLUSTER_NAME:\n$node_groups"
+    if ! node_group_name=$(prompt_user_for_value "Node group name"); then
+        log_error "Node group name is required!"
+        return 1
+    fi
+
+    log_empty_line
+    log_info "Listing EC2 instances for EKS node group '$node_group_name' in cluster $EKS_CLUSTER_NAME, region $AWS_REGION, account $AWS_PROFILE..."
+
+    run_and_log kubectl get nodes \
+        -l eks.amazonaws.com/nodegroup="$node_group_name" \
+        -o custom-columns=NAME:.metadata.name,ZONE:.metadata.labels."topology\.kubernetes\.io/zone",INSTANCE_ID:.spec.providerID
+}
+
+_describe_node_group() {
+    eks_cluster_name=$1
+    node_group_name=$2
+    aws_region=$3
+    aws_profile=$4
+
+    run_and_log aws eks describe-nodegroup \
+        --cluster-name "$eks_cluster_name" \
+        --nodegroup-name "$node_group_name" \
+        --region "$aws_region" \
+        --profile "$aws_profile" \
+        --output json
+}
+
+show_node_group_details() {
+    log_empty_line
+    log_info "Showing details of EKS node groups for cluster $EKS_CLUSTER_NAME in region $AWS_REGION for account $AWS_PROFILE:"
+    node_groups=$(_list_node_groups "$EKS_CLUSTER_NAME" "$AWS_REGION" "$AWS_PROFILE")
+    for node_group in $node_groups; do
+        log_info "Node group: $node_group"
+        _describe_node_group "$EKS_CLUSTER_NAME" "$node_group" "$AWS_REGION" "$AWS_PROFILE"
+        log_empty_line
+    done
+}
+
+_set_desired_size_of_node_group() {
+    local node_group_name="$1"
+    local desired_size="$2"
+
+    log_empty_line
+    log_info "Setting desired size of node group '$node_group_name' to $desired_size for cluster $EKS_CLUSTER_NAME in region $AWS_REGION for account $AWS_PROFILE..."
+
+    run_and_log aws eks update-nodegroup-config \
+        --cluster-name "$EKS_CLUSTER_NAME" \
+        --nodegroup-name "$node_group_name" \
+        --region "$AWS_REGION" \
+        --profile "$AWS_PROFILE" \
+        --scaling-config "desiredSize=$desired_size"
+}
+
+set_desired_size_of_node_group() {
+    local node_group_name
+    local desired_size
+
+    log_empty_line
+    # Promt user to select a node group
+    node_groups=$(_list_node_groups "$EKS_CLUSTER_NAME" "$AWS_REGION" "$AWS_PROFILE")
+    if [ -z "$node_groups" ]; then
+        log_error "No node groups found for cluster $EKS_CLUSTER_NAME."
+        return 1
+    fi
+    log_info "Node groups for cluster $EKS_CLUSTER_NAME:\n$node_groups"
+    if ! node_group_name=$(prompt_user_for_value "Node group name"); then
+        log_error "Node group name is required!"
+        return 1
+    fi
+    if ! desired_size=$(prompt_user_for_value "Desired size"); then
+        log_error "Desired size is required!"
+        return 1
+    fi
+
+    _set_desired_size_of_node_group "$node_group_name" "$desired_size"
+}
+
+terminate_ec2_instance_in_node_group() {
+    local instance_id
+
+    if ! instance_id=$(prompt_user_for_value "Instance ID to terminate"); then
+        log_error "Instance ID is required!"
+        return 1
+    fi
+
+    # Prompt user to confirm if desired capacity should also be decremented
+    log_empty_line
+    user_confirmed=$(prompt_user_for_confirmation "Do you also want to decrement the desired capacity of the node group? This will prevent the Auto Scaling Group from launching a replacement instance." "n")
+    if [[ "$user_confirmed" == "true" ]]; then
+        log_info "Terminating EC2 instance $instance_id and decrementing desired capacity of its parent node group..."
+        run_and_log aws autoscaling terminate-instance-in-auto-scaling-group \
+                        --instance-id "$instance_id" \
+                        --should-decrement-desired-capacity \
+                        --region "$AWS_REGION" \
+                        --profile "$AWS_PROFILE"
+    else
+        log_info "Terminating EC2 instance $instance_id without decrementing desired capacity of its parent node group. Auto Scaling Group may launch a replacement instance after termination."
+        run_and_log aws autoscaling terminate-instance-in-auto-scaling-group \
+                        --instance-id "$instance_id" \
+                        --no-should-decrement-desired-capacity \
+                        --region "$AWS_REGION" \
+                        --profile "$AWS_PROFILE"
+    fi
+
+    log_empty_line
 }
 
 eks() {
@@ -454,4 +668,133 @@ eks() {
     # EFS
     #
     # list_efs_volumes_in_use_in_k8s_cluster
+}
+
+eks_menu() {
+    if [[ -z "$EKS_CLUSTER_NAME" ]]; then
+        if ! EKS_CLUSTER_NAME=$(get_cluster_name_from_current_context); then
+            log_error "Failed to get cluster name from current context. Please ensure you have a valid kubeconfig context set. Error: $?"
+            return 1
+        fi
+    fi
+
+    local menu_options=(
+        "Show Kubernetes versions"
+        "Show current kubectl context"
+        "Show cluster version"
+        "Show cluster status"
+        "Show update status of cluster"
+        "Wait for cluster to be active"
+        "Verify EBS CSI driver is running"
+        "Verify EBS CSI driver nodes are running"
+        "Verify EBS CSI driver nodes are registered"
+        "Verify IMDSv2 and EC2 API connectivity"
+        "Describe CSI Node"
+        "List EBS Volumes"
+        "List EBS Volumes in use in K8s cluster"
+        "List EBS Volumes in use in K8s cluster with size >= 11Gi"
+        "Create snapshots for EBS Volumes in use in K8s cluster"
+        "List EFS Volumes in use in K8s cluster"
+        "Show cluster network architecture"
+        "List EKS addons"
+        "Show details of EKS addons"
+        "List EKS node groups"
+        "Show details of EKS node groups"
+        "Set desired size of node group"
+        "List EC2 instances for node group"
+        "Terminate EC2 instance in node group"
+        "EXIT"
+    )
+    while true; do
+        show_menu_select_message "EKS"
+        select option in "${menu_options[@]}"; do
+            if [[ -n "$option" ]]; then
+                log_info "Selected option: $option\n"
+                case $option in
+                    "Show Kubernetes versions")
+                        kubernetes_versions
+                        ;;
+                    "Show current kubectl context")
+                        show_current_context
+                        ;;
+                    "Show cluster version")
+                        get_cluster_version
+                        ;;
+                    "Show cluster status")
+                        show_cluster_status "$(get_cluster_name_from_current_context)"
+                        ;;
+                    "Show update status of cluster")
+                        show_update_status_of_cluster "$(get_cluster_name_from_current_context)"
+                        ;;
+                    "Wait for cluster to be active")
+                        wait_for_cluster_to_be_active "$(get_cluster_name_from_current_context)"
+                        ;;
+                    "Verify EBS CSI driver is running")
+                        verify_ebs_csi_is_running
+                        ;;
+                    "Verify EBS CSI driver nodes are running")
+                        verify_ebs_csi_nodes_are_running
+                        ;;
+                    "Verify EBS CSI driver nodes are registered")
+                        verify_ebs_csi_nodes_are_registered
+                        ;;
+                    "Verify IMDSv2 and EC2 API connectivity")
+                        verify_imdsv2_and_ec2_api_connectivity
+                        ;;
+                    "Describe CSI Node")
+                        describe_csi_node
+                        ;;
+                    "List EBS Volumes")
+                        list_ebs_volumes
+                        ;;
+                    "List EBS Volumes in use in K8s cluster")
+                        list_ebs_volumes_in_use_in_k8s_cluster
+                        ;;
+                    "List EBS Volumes in use in K8s cluster with size >= 11Gi")
+                        list_ebs_volumes_in_use_in_k8s_cluster 11
+                        ;;
+                    "Create snapshots for EBS Volumes in use in K8s cluster")
+                        create_snapshots_for_volumes_in_k8s_cluster 11
+                        ;;
+                    "List EFS Volumes in use in K8s cluster")
+                        list_efs_volumes_in_use_in_k8s_cluster
+                        ;;
+                    "Show cluster network architecture")
+                        show_cluster_network_architecture
+                        ;;
+                    "List EKS addons")
+                        list_addons
+                        ;;
+                    "Show details of EKS addons")
+                        show_addons_details
+                        ;;
+                    "List EKS node groups")
+                        list_node_groups
+                        ;;
+                    "Show details of EKS node groups")
+                        show_node_group_details
+                        ;;
+                    "Set desired size of node group")
+                        set_desired_size_of_node_group
+                        ;;
+                    "List EC2 instances for node group")
+                        list_ec2_instances_for_node_group
+                        ;;
+                    "Terminate EC2 instance in node group")
+                        terminate_ec2_instance_in_node_group
+                        ;;
+                    "EXIT")
+                        log_info "Exiting EKS menu."
+                        return 0
+                        ;;
+                    *)
+                        log_warning "Invalid option. Please try again."
+                        ;;
+                esac
+                break
+            else
+                log_warning "Invalid selection. Please choose a valid option."
+            fi
+        done
+    done
 }

@@ -42,6 +42,51 @@ authenticate_aws_cli_using_sso() {
     fi
 }
 
-sts() {
-    show_current_caller_iam_identity
+# sts() {
+#     show_current_caller_iam_identity
+# }
+
+sts_menu() {
+    local menu_options=(
+        "Show current caller IAM identity"
+        "Check AWS credentials"
+        "Authenticate AWS CLI using SSO"
+        "EXIT"
+    )
+
+    while true; do
+        log_empty_line
+        log_info "STS menu - choose an option:"
+        select option in "${menu_options[@]}"; do
+            if [[ -n "$option" ]]; then
+                log_info "Selected option: $option\n"
+                case $option in
+                    "Show current caller IAM identity")
+                        show_current_caller_iam_identity
+                        ;;
+                    "Check AWS credentials")
+                        check_aws_credentials
+                        ;;
+                    "Authenticate AWS CLI using SSO")
+                        local profile
+                        if ! profile=$(prompt_user_for_value "AWS profile for SSO authentication"); then
+                            log_error "AWS profile is required!"
+                            break
+                        fi
+                        authenticate_aws_cli_using_sso "$profile"
+                        ;;
+                    "EXIT")
+                        log_info "Exiting STS menu."
+                        return 0
+                        ;;
+                    *)
+                        log_error "Invalid option"
+                        ;;
+                esac
+                break
+            else
+                log_error "Invalid selection. Please choose a valid option."
+            fi
+        done
+    done
 }

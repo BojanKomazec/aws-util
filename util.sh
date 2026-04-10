@@ -7,3 +7,7 @@ show_menu_select_message() {
     log_prompt "[$menu_name] Please select an option:"
 }
 
+run_and_log() {
+    log_wait "Executing command: $*"
+    "$@"
+}
